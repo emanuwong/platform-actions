@@ -1,0 +1,157 @@
+name: terraform-reusable
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        type: string
+        required: false
+        default: "."
+      tf_version:
+        type: string
+        required: false
+        default: "1.10.0"
+      aws_region:
+        type: string
+        required: true
+      command:
+        type: string
+        required: true
+        description: "plan | apply"
+      var_file:
+        type: string
+        required: false
+        default: ""
+      backend_bucket:
+        type: string
+        required: false
+        default: ""
+      backend_key:
+        type: string
+        required: false
+        default: ""
+      use_lockfile:
+        type: boolean
+        required: false
+        default: true
+      plan_detailed_exitcode:
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      AWS_ROLE_ARN:
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+# Prevent concurrent runs fighting over the same backend key/state
+concurrency:
+  group: terraform-${{ github.repository }}-${{ inputs.working_directory }}-${{ inputs.backend_key }}
+  cancel-in-progress: false
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.tf_version }}
+
+      
+      
+      - name: Check OIDC permissions (safe)
+        run: |
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL=$ACTIONS_ID_TOKEN_REQUEST_URL"
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN is set? -> $([[ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]] && echo yes || echo no)"
+      
+      - name: Fetch OIDC JWT claims (safe)
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, json, urllib.request, base64
+          url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
+          req_token = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+          if not url or not req_token:
+            print("Missing ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN")
+            raise SystemExit(1)
+          req = urllib.request.Request(url, headers={"Authorization": f"Bearer {req_token}"})
+          with urllib.request.urlopen(req) as resp:
+            data = json.load(resp)
+
+          jwt = data["value"]
+          payload = jwt.split(".")[1]
+          payload += "=" * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload.encode()).decode())  
+          # Only print non-sensitive claims needed for IAM trust debugging
+          for k in ["iss","aud","sub","repository","ref","event_name","job_workflow_ref","workflow_ref","actor"]:
+            if k in claims:
+              print(f"{k}: {claims[k]}")
+          PY
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+    
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.backend_bucket }}" ] && [ -n "${{ inputs.backend_key }}" ]; then
+            terraform init \
+              -backend-config="bucket=${{ inputs.backend_bucket }}" \
+              -backend-config="key=${{ inputs.backend_key }}" \
+              -backend-config="region=${{ inputs.aws_region }}" \
+              -backend-config="encrypt=true" \
+              -backend-config="use_lockfile=${{ inputs.use_lockfile }}"
+          else
+            terraform init
+          fi
+
+      - name: Terraform validate
+        run: terraform validate
+
+      - name: Terraform plan
+        if: ${{ inputs.command == 'plan' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARGS=(-no-color)
+          if [ -n "${{ inputs.var_file }}" ]; then
+            ARGS+=(-var-file="${{ inputs.var_file }}")
+          fi
+
+          if [ "${{ inputs.plan_detailed_exitcode }}" = "true" ]; then
+            # exit 0 = no changes, 2 = changes present
+            terraform plan "${ARGS[@]}" -detailed-exitcode || RC=$?
+            if [ "${RC:-0}" -eq 1 ]; then
+              exit 1
+            fi
+            exit 0
+          else
+            terraform plan "${ARGS[@]}"
+          fi
+
+      - name: Terraform apply
+        if: ${{ inputs.command == 'apply' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARGS=(-auto-approve)
+          if [ -n "${{ inputs.var_file }}" ]; then
+            ARGS+=(-var-file="${{ inputs.var_file }}")
+          fi
+
+          terraform apply "${ARGS[@]}"
