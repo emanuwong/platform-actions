@@ -17,7 +17,7 @@ on:
       command:
         type: string
         required: true
-        description: "plan | apply"
+        description: "plan | apply | destroy"
       var_file:
         type: string
         required: false
@@ -155,3 +155,15 @@ jobs:
           fi
 
           terraform apply "${ARGS[@]}"
+
+      - name: Terraform destroy
+        if: ${{ inputs.command == 'destroy' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARGS=(-auto-approve)
+          if [ -n "${{ inputs.var_file }}" ]; then
+            ARGS+=(-var-file="${{ inputs.var_file }}")
+          fi
+          terraform destroy "${ARGS[@]}"
+
